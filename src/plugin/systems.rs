@@ -21,6 +21,8 @@ use crate::prelude::{
 use crate::utils;
 use bevy::ecs::system::{StaticSystemParam, SystemParamItem};
 use bevy::prelude::*;
+use big_space::{FloatingOriginSettings, GridCell, FloatingOrigin};
+use big_space::precision::GridPrecision;
 use rapier::prelude::*;
 use std::collections::HashMap;
 
@@ -35,13 +37,14 @@ use crate::control::CharacterCollision;
 use bevy::math::Vec3Swizzles;
 
 /// Components that will be updated after a physics step.
-pub type RigidBodyWritebackComponents<'a> = (
+pub type RigidBodyWritebackComponents<'a, P> = (
     Entity,
     Option<&'a Parent>,
     Option<&'a mut Transform>,
     Option<&'a mut TransformInterpolation>,
     Option<&'a mut Velocity>,
     Option<&'a mut Sleeping>,
+    Option<&'a GridCell<P>>,
 );
 
 /// Components related to rigid-bodies.
@@ -525,13 +528,15 @@ pub fn apply_joint_user_changes(
 
 /// System responsible for writing the result of the last simulation step into our `bevy_rapier`
 /// components and the [`GlobalTransform`] component.
-pub fn writeback_rigid_bodies(
+pub fn writeback_rigid_bodies<P: GridPrecision> (
     mut context: ResMut<RapierContext>,
     config: Res<RapierConfiguration>,
     sim_to_render_time: Res<SimulationToRenderTime>,
     global_transforms: Query<&GlobalTransform>,
+    floating_origin_settings: Res<FloatingOriginSettings>,
+    origin_cell_query: Query<&GridCell<P>, With<FloatingOrigin>>,
     mut writeback: Query<
-        RigidBodyWritebackComponents,
+        RigidBodyWritebackComponents::<P>,
         (With<RigidBody>, Without<RigidBodyDisabled>),
     >,
 ) {
@@ -539,7 +544,9 @@ pub fn writeback_rigid_bodies(
     let scale = context.physics_scale;
 
     if config.physics_pipeline_active {
-        for (entity, parent, transform, mut interpolation, mut velocity, mut sleeping) in
+        let origin_cell = origin_cell_query.single();
+
+        for (entity, parent, transform, mut interpolation, mut velocity, mut sleeping, grid_cell) in
             writeback.iter_mut()
         {
             // TODO: do this the other way round: iterate through Rapier’s RigidBodySet on the active bodies,
@@ -552,7 +559,16 @@ pub fn writeback_rigid_bodies(
                     if let TimestepMode::Interpolated { dt, .. } = config.timestep_mode {
                         if let Some(interpolation) = interpolation.as_deref_mut() {
                             if interpolation.end.is_none() {
-                                interpolation.end = Some(*rb.position());
+                                if let (Some(grid_cell), Some(transform)) = (grid_cell, &transform) {
+                                    let grid_cell_delta = grid_cell - origin_cell;
+                                    let translation = floating_origin_settings.grid_position(&grid_cell_delta, transform);
+                                    interpolation.end = Some(utils::transform_to_iso(
+                                        &transform.with_translation(translation),
+                                        scale
+                                    ));
+                                } else {
+                                    interpolation.end = Some(*rb.position());
+                                }
                             }
 
                             if let Some(interpolated) =
@@ -564,6 +580,13 @@ pub fn writeback_rigid_bodies(
                     }
 
                     if let Some(mut transform) = transform {
+                        if let Some(grid_cell) = grid_cell {
+                            let grid_cell_delta = grid_cell - origin_cell;
+                            let old_global_translation = floating_origin_settings.grid_position(&grid_cell_delta, &transform);
+                            let translation_delta = interpolated_pos.translation - old_global_translation;
+                            interpolated_pos.translation = transform.translation + translation_delta;
+                        }
+
                         // NOTE: we query the parent’s global transform here, which is a bit
                         //       unfortunate (performance-wise). An alternative would be to
                         //       deduce the parent’s global transform from the current entity’s
@@ -1512,6 +1535,7 @@ mod tests {
         time::TimePlugin,
         window::WindowPlugin,
     };
+    use big_space::{FloatingOriginPlugin, FloatingOrigin, GridCell};
     use std::f32::consts::PI;
 
     use super::*;
@@ -1683,10 +1707,12 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((
             HeadlessRenderPlugin,
-            TransformPlugin,
             TimePlugin,
+            FloatingOriginPlugin::<i32>::default(),
             RapierPhysicsPlugin::<NoUserData>::default(),
         ));
+
+        app.world.spawn((TransformBundle::default(), FloatingOrigin, GridCell::<i32>::default()));
 
         let zero = (Transform::default(), Transform::default());
 
@@ -1740,10 +1766,12 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((
             HeadlessRenderPlugin,
-            TransformPlugin,
             TimePlugin,
+            FloatingOriginPlugin::<i32>::default(),
             RapierPhysicsPlugin::<NoUserData>::default(),
         ));
+
+        app.world.spawn((TransformBundle::default(), FloatingOrigin, GridCell::<i32>::default()));
 
         let zero = (Transform::default(), Transform::default());
 
@@ -1813,6 +1841,116 @@ mod tests {
             );
             approx::assert_relative_eq!(body_transform.scale, child_transform.scale,);
         }
+    }
+
+    #[test]
+    fn floating_transform_writeback() {
+        let mut app = App::new();
+        app.add_plugins((
+            HeadlessRenderPlugin,
+            TimePlugin,
+            FloatingOriginPlugin::<i32>::new(1000.0, 100.0),
+            RapierPhysicsPlugin::<NoUserData>::default(),
+        ));
+
+        app.world.spawn((
+            TransformBundle::default(),
+            FloatingOrigin,
+            GridCell::<i32>::new(1, 0, 0),
+        ));
+
+        let body = app
+            .world
+            .spawn((
+                TransformBundle::from_transform(Transform {
+                    translation: Vec3::new(-500.0, 0.0, 0.0),
+                    rotation: Quat::from_rotation_z(PI),
+                    ..Default::default()
+                }),
+                GridCell::<i32>::new(6, 0, 0),
+                RigidBody::Fixed,
+                Collider::ball(1.0),
+            ))
+            .id();
+
+        app.update();
+
+        let mut entity_mut = app.world.entity_mut(body);
+        let mut transform = entity_mut.get_mut::<Transform>().unwrap();
+        transform.translation.y = 20.0;
+
+        app.update();
+
+        let global_transform = app.world.entity(body).get::<GlobalTransform>().unwrap();
+        
+        let context = app.world.resource::<RapierContext>();
+        let body_handle = context.entity2body[&body];
+        let rigid_body = context.bodies.get(body_handle).unwrap();
+        let body_physics_transform =
+            utils::iso_to_transform(rigid_body.position(), context.physics_scale);
+
+        approx::assert_relative_eq!(
+            body_physics_transform.translation,
+            global_transform.translation(),
+        );
+    }
+
+    #[test]
+    fn floating_transform_propagation() {
+        let mut app = App::new();
+        app.add_plugins((
+            HeadlessRenderPlugin,
+            TimePlugin,
+            FloatingOriginPlugin::<i32>::new(1000.0, 100.0),
+            RapierPhysicsPlugin::<NoUserData>::default(),
+        ));
+
+        app.world.spawn((
+            TransformBundle::default(),
+            FloatingOrigin,
+            GridCell::<i32>::new(1, 0, 0),
+        ));
+        
+        let child = app
+            .world
+            .spawn((
+                TransformBundle::from_transform(Transform {
+                    translation: Vec3::new(0.0, 20.0, 0.0),
+                    rotation: Quat::from_rotation_z(PI),
+                    ..Default::default()
+                }),
+                RigidBody::Fixed,
+                Collider::ball(1.0),
+            ))
+            .id();
+
+        app
+            .world
+            .spawn((
+                TransformBundle::from_transform(Transform {
+                    translation: Vec3::new(500.0, 0.0, 0.0),
+                    rotation: Quat::from_rotation_z(PI),
+                    ..Default::default()
+                }),
+                GridCell::<i32>::new(6, 0, 0),
+                RigidBody::Fixed,
+                Collider::ball(1.0),
+            ))
+            .push_children(&[child]);
+
+        app.update();
+
+        let child_transform = app.world.entity(child).get::<GlobalTransform>().unwrap();
+        let context = app.world.resource::<RapierContext>();
+        let child_handle = context.entity2body[&child];
+        let child_body = context.bodies.get(child_handle).unwrap();
+        let body_transform =
+            utils::iso_to_transform(child_body.position(), context.physics_scale);
+        assert_eq!(
+            body_transform.translation,
+            child_transform.translation(),
+            "Use of floating origin should result in correct GlobalTransform"
+        );
     }
 
     // Allows run tests for systems containing rendering related things without GPU

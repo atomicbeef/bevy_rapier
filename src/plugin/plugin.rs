@@ -8,6 +8,9 @@ use bevy::ecs::{
     system::SystemParamItem,
 };
 use bevy::{prelude::*, transform::TransformSystem};
+use big_space::precision::GridPrecision;
+use big_space::propagation::propagate_transforms;
+use big_space::{recenter_transform_on_grid, sync_simple_transforms, update_global_from_grid};
 use std::marker::PhantomData;
 
 /// No specific user-data is associated to the hooks.
@@ -17,17 +20,18 @@ pub type NoUserData = ();
 ///
 /// This will automatically setup all the resources needed to run a physics simulation with the
 /// Rapier physics engine.
-pub struct RapierPhysicsPlugin<PhysicsHooks = ()> {
+pub struct RapierPhysicsPlugin<PhysicsHooks = (), Precision = i32> {
     schedule: Box<dyn ScheduleLabel>,
     physics_scale: f32,
     default_system_setup: bool,
-    _phantom: PhantomData<PhysicsHooks>,
+    _phantom: PhantomData<(PhysicsHooks, Precision)>,
 }
 
-impl<PhysicsHooks> RapierPhysicsPlugin<PhysicsHooks>
+impl<PhysicsHooks, Precision> RapierPhysicsPlugin<PhysicsHooks, Precision>
 where
     PhysicsHooks: 'static + BevyPhysicsHooks,
     for<'w, 's> SystemParamItem<'w, 's, PhysicsHooks>: BevyPhysicsHooks,
+    Precision: GridPrecision,
 {
     /// Specifies a scale ratio between the physics world and the bevy transforms.
     ///
@@ -75,17 +79,17 @@ where
     /// Provided for use when staging systems outside of this plugin using
     /// [`with_system_setup(false)`](Self::with_system_setup).
     /// See [`PhysicsSet`] for a description of these systems.
-    pub fn get_systems(set: PhysicsSet) -> SystemConfigs {
+    pub fn get_systems<P: GridPrecision>(set: PhysicsSet) -> SystemConfigs {
         match set {
             PhysicsSet::SyncBackend => (
                 // Run the character controller before the manual transform propagation.
                 systems::update_character_controls,
                 // Run Bevy transform propagation additionally to sync [`GlobalTransform`]
                 (
-                    bevy::transform::systems::sync_simple_transforms,
-                    bevy::transform::systems::propagate_transforms,
+                    (sync_simple_transforms::<P>, update_global_from_grid::<P>).in_set(RapierFloatingOriginSet),
+                    recenter_transform_on_grid::<P>.before(RapierFloatingOriginSet),
+                    propagate_transforms::<P>.after(RapierFloatingOriginSet),
                 )
-                    .chain()
                     .in_set(RapierTransformPropagateSet),
                 #[cfg(all(feature = "dim3", feature = "async-collider"))]
                 systems::init_async_scene_colliders.after(bevy::scene::scene_spawner_system),
@@ -115,7 +119,7 @@ where
                 .into_configs(),
             PhysicsSet::Writeback => (
                 systems::update_colliding_entities,
-                systems::writeback_rigid_bodies,
+                systems::writeback_rigid_bodies::<P>,
                 systems::writeback_mass_properties,
                 Events::<MassModifiedEvent>::update_system
                     .after(systems::writeback_mass_properties),
@@ -131,7 +135,10 @@ where
 #[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
 pub struct RapierTransformPropagateSet;
 
-impl<PhysicsHooksSystemParam> Default for RapierPhysicsPlugin<PhysicsHooksSystemParam> {
+#[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+pub struct RapierFloatingOriginSet;
+
+impl<PhysicsHooksSystemParam, Precision> Default for RapierPhysicsPlugin<PhysicsHooksSystemParam, Precision> {
     fn default() -> Self {
         Self {
             schedule: Box::new(PostUpdate),
@@ -161,10 +168,11 @@ pub enum PhysicsSet {
     Writeback,
 }
 
-impl<PhysicsHooks> Plugin for RapierPhysicsPlugin<PhysicsHooks>
+impl<PhysicsHooks, Precision> Plugin for RapierPhysicsPlugin<PhysicsHooks, Precision>
 where
     PhysicsHooks: 'static + BevyPhysicsHooks,
     for<'w, 's> SystemParamItem<'w, 's, PhysicsHooks>: BevyPhysicsHooks,
+    Precision: GridPrecision,
 {
     fn build(&self, app: &mut App) {
         // Register components as reflectable.
@@ -221,10 +229,10 @@ where
             app.add_systems(
                 self.schedule.clone(),
                 (
-                    Self::get_systems(PhysicsSet::SyncBackend).in_set(PhysicsSet::SyncBackend),
-                    Self::get_systems(PhysicsSet::StepSimulation)
+                    Self::get_systems::<Precision>(PhysicsSet::SyncBackend).in_set(PhysicsSet::SyncBackend),
+                    Self::get_systems::<Precision>(PhysicsSet::StepSimulation)
                         .in_set(PhysicsSet::StepSimulation),
-                    Self::get_systems(PhysicsSet::Writeback).in_set(PhysicsSet::Writeback),
+                    Self::get_systems::<Precision>(PhysicsSet::Writeback).in_set(PhysicsSet::Writeback),
                 ),
             );
 

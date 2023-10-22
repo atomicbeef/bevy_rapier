@@ -30,14 +30,14 @@ fn main() {
     app.add_systems(
         PostUpdate,
         (
-            RapierPhysicsPlugin::<NoUserData>::get_systems(PhysicsSet::SyncBackend)
+            RapierPhysicsPlugin::<NoUserData, i32>::get_systems::<i32>(PhysicsSet::SyncBackend)
                 .in_set(PhysicsSet::SyncBackend),
             (
-                RapierPhysicsPlugin::<NoUserData>::get_systems(PhysicsSet::StepSimulation),
+                RapierPhysicsPlugin::<NoUserData, i32>::get_systems::<i32>(PhysicsSet::StepSimulation),
                 despawn_one_box,
             )
                 .in_set(PhysicsSet::StepSimulation),
-            RapierPhysicsPlugin::<NoUserData>::get_systems(PhysicsSet::Writeback)
+            RapierPhysicsPlugin::<NoUserData, i32>::get_systems::<i32>(PhysicsSet::Writeback)
                 .in_set(PhysicsSet::Writeback),
         ),
     );
