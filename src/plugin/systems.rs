@@ -21,7 +21,6 @@ use crate::prelude::{
 use crate::utils;
 use bevy::ecs::system::{StaticSystemParam, SystemParamItem};
 use bevy::prelude::*;
-use big_space::{FloatingOriginSettings, GridCell, FloatingOrigin};
 use big_space::precision::GridPrecision;
 use rapier::prelude::*;
 use std::collections::HashMap;
@@ -37,14 +36,14 @@ use crate::control::CharacterCollision;
 use bevy::math::Vec3Swizzles;
 
 /// Components that will be updated after a physics step.
-pub type RigidBodyWritebackComponents<'a, P> = (
+pub type RigidBodyWritebackComponents<'a> = (
     Entity,
     Option<&'a Parent>,
     Option<&'a mut Transform>,
+    Option<&'a GlobalTransform>,
     Option<&'a mut TransformInterpolation>,
     Option<&'a mut Velocity>,
     Option<&'a mut Sleeping>,
-    Option<&'a GridCell<P>>,
 );
 
 /// Components related to rigid-bodies.
@@ -533,10 +532,8 @@ pub fn writeback_rigid_bodies<P: GridPrecision> (
     config: Res<RapierConfiguration>,
     sim_to_render_time: Res<SimulationToRenderTime>,
     global_transforms: Query<&GlobalTransform>,
-    floating_origin_settings: Res<FloatingOriginSettings>,
-    origin_cell_query: Query<&GridCell<P>, With<FloatingOrigin>>,
     mut writeback: Query<
-        RigidBodyWritebackComponents::<P>,
+        RigidBodyWritebackComponents,
         (With<RigidBody>, Without<RigidBodyDisabled>),
     >,
 ) {
@@ -544,9 +541,7 @@ pub fn writeback_rigid_bodies<P: GridPrecision> (
     let scale = context.physics_scale;
 
     if config.physics_pipeline_active {
-        let origin_cell = origin_cell_query.single();
-
-        for (entity, parent, transform, mut interpolation, mut velocity, mut sleeping, grid_cell) in
+        for (entity, parent, transform, global_transform, mut interpolation, mut velocity, mut sleeping) in
             writeback.iter_mut()
         {
             // TODO: do this the other way round: iterate through Rapier’s RigidBodySet on the active bodies,
@@ -559,16 +554,7 @@ pub fn writeback_rigid_bodies<P: GridPrecision> (
                     if let TimestepMode::Interpolated { dt, .. } = config.timestep_mode {
                         if let Some(interpolation) = interpolation.as_deref_mut() {
                             if interpolation.end.is_none() {
-                                if let (Some(grid_cell), Some(transform)) = (grid_cell, &transform) {
-                                    let grid_cell_delta = grid_cell - origin_cell;
-                                    let translation = floating_origin_settings.grid_position(&grid_cell_delta, transform);
-                                    interpolation.end = Some(utils::transform_to_iso(
-                                        &transform.with_translation(translation),
-                                        scale
-                                    ));
-                                } else {
-                                    interpolation.end = Some(*rb.position());
-                                }
+                                interpolation.end = Some(*rb.position());
                             }
 
                             if let Some(interpolated) =
@@ -579,14 +565,7 @@ pub fn writeback_rigid_bodies<P: GridPrecision> (
                         }
                     }
 
-                    if let Some(mut transform) = transform {
-                        if let Some(grid_cell) = grid_cell {
-                            let grid_cell_delta = grid_cell - origin_cell;
-                            let old_global_translation = floating_origin_settings.grid_position(&grid_cell_delta, &transform);
-                            let translation_delta = interpolated_pos.translation - old_global_translation;
-                            interpolated_pos.translation = transform.translation + translation_delta;
-                        }
-
+                    if let (Some(mut transform), Some(global_transform)) = (transform, global_transform) {
                         // NOTE: we query the parent’s global transform here, which is a bit
                         //       unfortunate (performance-wise). An alternative would be to
                         //       deduce the parent’s global transform from the current entity’s
@@ -640,6 +619,10 @@ pub fn writeback_rigid_bodies<P: GridPrecision> (
                                 .last_body_transform_set
                                 .insert(handle, new_global_transform);
                         } else {
+                            let old_global_translation = global_transform.translation();
+                            let translation_delta = interpolated_pos.translation - old_global_translation;
+                            interpolated_pos.translation = transform.translation + translation_delta;
+
                             // In 2D, preserve the transform `z` component that may have been set by the user
                             #[cfg(feature = "dim2")]
                             {
@@ -1535,7 +1518,7 @@ mod tests {
         time::TimePlugin,
         window::WindowPlugin,
     };
-    use big_space::{FloatingOriginPlugin, FloatingOrigin, GridCell};
+    use big_space::{FloatingOriginPlugin, FloatingOrigin, FloatingOriginSettings, GridCell};
     use std::f32::consts::PI;
 
     use super::*;
@@ -1893,6 +1876,118 @@ mod tests {
             body_physics_transform.translation,
             global_transform.translation(),
         );
+    }
+
+    #[test]
+    fn floating_origin_change_simple() {
+        let mut app = App::new();
+        app.add_plugins((
+            HeadlessRenderPlugin,
+            TimePlugin,
+            FloatingOriginPlugin::<i32>::new(1000.0, 100.0),
+            RapierPhysicsPlugin::<NoUserData>::default(),
+        ));
+
+        let original_floating_origin = app
+            .world
+            .spawn((TransformBundle::default(), FloatingOrigin, GridCell::<i32>::default()))
+            .id();
+
+        let original_transform = Transform::from_translation(Vec3::new(-500.0, -500.0, 0.0));
+        let original_grid_cell = GridCell::<i32>::new(-1, -1, 0);
+
+        let body = app
+            .world
+            .spawn((
+                TransformBundle::from_transform(original_transform),
+                original_grid_cell,
+                RigidBody::Fixed,
+                Collider::ball(1.0),
+            ))
+            .id();
+
+        let new_floating_origin = app
+            .world
+            .spawn((
+                TransformBundle::from_transform(Transform::from_translation(Vec3::new(500.0, 500.0, 0.0))),
+                GridCell::<i32>::new(1, 1, 0),
+            ))
+            .id();
+
+        app.update();
+
+        app.world.entity_mut(original_floating_origin).remove::<FloatingOrigin>();
+        app.world.entity_mut(new_floating_origin).insert(FloatingOrigin);
+
+        app.update();
+        
+        let transform = app.world.entity(body).get::<Transform>().unwrap();
+        let grid_cell = app.world.entity(body).get::<GridCell<i32>>().unwrap();
+
+        let floating_origin_settings = app.world.resource::<FloatingOriginSettings>();
+
+        let original_grid_position = floating_origin_settings.grid_position(&original_grid_cell, &original_transform);
+        let new_grid_position = floating_origin_settings.grid_position(grid_cell, &transform);
+        approx::assert_relative_eq!(original_grid_position, new_grid_position);
+    }
+
+    #[test]
+    fn floating_origin_change() {
+        let mut app = App::new();
+        app.add_plugins((
+            HeadlessRenderPlugin,
+            TimePlugin,
+            FloatingOriginPlugin::<i32>::new(1000.0, 100.0),
+            RapierPhysicsPlugin::<NoUserData>::default(),
+        ));
+
+        let original_transform1 = Transform::from_translation(Vec3::new(-500.0, -500.0, 0.0));
+        let original_grid_cell1 = GridCell::<i32>::new(-1, -1, 0);
+
+        let body1 = app
+            .world
+            .spawn((
+                TransformBundle::from_transform(original_transform1),
+                original_grid_cell1,
+                RigidBody::Fixed,
+                Collider::ball(1.0),
+                FloatingOrigin,
+            ))
+            .id();
+
+        let original_transform2 = Transform::from_translation(Vec3::new(500.0, 500.0, 0.0));
+        let original_grid_cell2 = GridCell::<i32>::new(1, 1, 0);
+
+        let body2 = app
+            .world
+            .spawn((
+                TransformBundle::from_transform(original_transform2),
+                original_grid_cell2,
+                RigidBody::Fixed,
+                Collider::ball(1.0),
+            ))
+            .id();
+
+        app.update();
+
+        app.world.entity_mut(body1).remove::<FloatingOrigin>();
+        app.world.entity_mut(body2).insert(FloatingOrigin);
+
+        app.update();
+        
+        let transform1 = app.world.entity(body1).get::<Transform>().unwrap();
+        let grid_cell1 = app.world.entity(body1).get::<GridCell<i32>>().unwrap();
+        let transform2 = app.world.entity(body2).get::<Transform>().unwrap();
+        let grid_cell2 = app.world.entity(body2).get::<GridCell<i32>>().unwrap();
+
+        let floating_origin_settings = app.world.resource::<FloatingOriginSettings>();
+
+        let original_grid_position1 = floating_origin_settings.grid_position(&original_grid_cell1, &original_transform1);
+        let new_grid_position1 = floating_origin_settings.grid_position(grid_cell1, &transform1);
+        let original_grid_position2 = floating_origin_settings.grid_position(&original_grid_cell2, &original_transform2);
+        let new_grid_position2 = floating_origin_settings.grid_position(grid_cell2, &transform2);
+        approx::assert_relative_eq!(original_grid_position1, new_grid_position1);
+        approx::assert_relative_eq!(original_grid_position2, new_grid_position2);
     }
 
     #[test]
