@@ -2,10 +2,13 @@ use crate::pipeline::{CollisionEvent, ContactForceEvent};
 use crate::plugin::configuration::SimulationToRenderTime;
 use crate::plugin::{systems, RapierConfiguration, RapierContext};
 use crate::prelude::*;
-use bevy::ecs::{
-    event::Events,
-    schedule::{ScheduleLabel, SystemConfigs},
-    system::SystemParamItem,
+use bevy::{
+    ecs::{
+        event::{event_update_system, Events},
+        schedule::{ScheduleLabel, SystemConfigs},
+        system::SystemParamItem,
+    },
+    utils::intern::Interned,
 };
 use bevy::{prelude::*, transform::TransformSystem};
 use big_space::precision::GridPrecision;
@@ -21,7 +24,7 @@ pub type NoUserData = ();
 /// This will automatically setup all the resources needed to run a physics simulation with the
 /// Rapier physics engine.
 pub struct RapierPhysicsPlugin<PhysicsHooks = (), Precision = i32> {
-    schedule: Box<dyn ScheduleLabel>,
+    schedule: Interned<dyn ScheduleLabel>,
     physics_scale: f32,
     default_system_setup: bool,
     _phantom: PhantomData<(PhysicsHooks, Precision)>,
@@ -72,7 +75,7 @@ where
 
     /// Adds the physics systems to the provided schedule rather than `PostUpdate`.
     pub fn in_schedule(mut self, schedule: impl ScheduleLabel) -> Self {
-        self.schedule = Box::new(schedule);
+        self.schedule = schedule.intern();
         self
     }
 
@@ -92,7 +95,7 @@ where
                 )
                     .in_set(RapierTransformPropagateSet),
                 #[cfg(all(feature = "dim3", feature = "async-collider"))]
-                systems::init_async_scene_colliders.after(bevy::scene::scene_spawner_system),
+                systems::init_async_scene_colliders,
                 #[cfg(all(feature = "dim3", feature = "async-collider"))]
                 systems::init_async_colliders,
                 systems::init_rigid_bodies,
@@ -111,9 +114,9 @@ where
                 .into_configs(),
             PhysicsSet::StepSimulation => (
                 systems::step_simulation::<PhysicsHooks>,
-                Events::<CollisionEvent>::update_system
+                event_update_system::<CollisionEvent>
                     .before(systems::step_simulation::<PhysicsHooks>),
-                Events::<ContactForceEvent>::update_system
+                event_update_system::<ContactForceEvent>
                     .before(systems::step_simulation::<PhysicsHooks>),
             )
                 .into_configs(),
@@ -121,8 +124,7 @@ where
                 systems::update_colliding_entities,
                 systems::writeback_rigid_bodies::<P>,
                 systems::writeback_mass_properties,
-                Events::<MassModifiedEvent>::update_system
-                    .after(systems::writeback_mass_properties),
+                event_update_system::<MassModifiedEvent>.after(systems::writeback_mass_properties),
             )
                 .into_configs(),
         }
@@ -141,7 +143,7 @@ pub struct RapierFloatingOriginSet;
 impl<PhysicsHooksSystemParam, Precision> Default for RapierPhysicsPlugin<PhysicsHooksSystemParam, Precision> {
     fn default() -> Self {
         Self {
-            schedule: Box::new(PostUpdate),
+            schedule: PostUpdate.intern(),
             physics_scale: 1.0,
             default_system_setup: true,
             _phantom: PhantomData,
@@ -213,7 +215,7 @@ where
         // Add each set as necessary
         if self.default_system_setup {
             app.configure_sets(
-                self.schedule.clone(),
+                self.schedule,
                 (
                     PhysicsSet::SyncBackend,
                     PhysicsSet::StepSimulation,
@@ -227,7 +229,7 @@ where
             app.add_systems(PostUpdate, (systems::sync_removals,));
 
             app.add_systems(
-                self.schedule.clone(),
+                self.schedule,
                 (
                     Self::get_systems::<Precision>(PhysicsSet::SyncBackend).in_set(PhysicsSet::SyncBackend),
                     Self::get_systems::<Precision>(PhysicsSet::StepSimulation)
