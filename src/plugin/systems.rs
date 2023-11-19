@@ -1835,6 +1835,11 @@ mod tests {
             RapierPhysicsPlugin::<NoUserData>::default(),
         ));
 
+        app.insert_resource(RapierConfiguration {
+            force_update_from_transform_changes: true,
+            ..Default::default()
+        });
+
         app.world.spawn((
             TransformBundle::default(),
             FloatingOrigin,
@@ -1886,6 +1891,11 @@ mod tests {
             FloatingOriginPlugin::<i32>::new(1000.0, 100.0),
             RapierPhysicsPlugin::<NoUserData>::default(),
         ));
+
+        app.insert_resource(RapierConfiguration {
+            force_update_from_transform_changes: true,
+            ..Default::default()
+        });
 
         let original_floating_origin = app
             .world
@@ -1939,6 +1949,11 @@ mod tests {
             FloatingOriginPlugin::<i32>::new(1000.0, 100.0),
             RapierPhysicsPlugin::<NoUserData>::default(),
         ));
+
+        app.insert_resource(RapierConfiguration {
+            force_update_from_transform_changes: true,
+            ..Default::default()
+        });
 
         let original_transform1 = Transform::from_translation(Vec3::new(-500.0, -500.0, 0.0));
         let original_grid_cell1 = GridCell::<i32>::new(-1, -1, 0);
@@ -1998,6 +2013,11 @@ mod tests {
             FloatingOriginPlugin::<i32>::new(1000.0, 100.0),
             RapierPhysicsPlugin::<NoUserData>::default(),
         ));
+
+        app.insert_resource(RapierConfiguration {
+            force_update_from_transform_changes: true,
+            ..Default::default()
+        });
 
         app.world.spawn((
             TransformBundle::default(),
